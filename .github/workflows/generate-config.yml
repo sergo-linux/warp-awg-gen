@@ -1,0 +1,86 @@
+name: Generate WARP config
+
+on:
+  workflow_dispatch:
+    inputs:
+      recipient_certificate:
+        description: Base64-encoded PEM certificate for encrypted delivery
+        type: string
+        required: true
+      mask:
+        description: Packet mask
+        type: choice
+        default: quic
+        options:
+          - quic
+          - dns
+          - sip
+          - random
+      endpoint:
+        description: 'Cloudflare endpoint (leave empty for automatic selection)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build and check
+        run: |
+          go test ./...
+          go build -o "$RUNNER_TEMP/warp-awg-gen" .
+      - name: Generate configuration
+        env:
+          MASK: ${{ inputs.mask || 'quic' }}
+          ENDPOINT: ${{ inputs.endpoint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/warp-output"
+          args=(--fresh-reg --reg-cache "$RUNNER_TEMP/warp-reg.json" --mask "$MASK" --mtu 1280 -o "$RUNNER_TEMP/warp-output/warp-awg.conf")
+          if [[ -n "$ENDPOINT" ]]; then
+            args+=(--endpoint "$ENDPOINT")
+          fi
+          "$RUNNER_TEMP/warp-awg-gen" "${args[@]}"
+          test -s "$RUNNER_TEMP/warp-output/warp-awg.conf"
+      - name: Encrypt configuration
+        env:
+          RECIPIENT_CERTIFICATE: ${{ inputs.recipient_certificate }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RECIPIENT_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/recipient.pem"
+          openssl cms -encrypt -binary -aes-256-cbc -in "$RUNNER_TEMP/warp-output/warp-awg.conf" -out "$RUNNER_TEMP/warp-output/warp-awg.conf.cms" -outform DER "$RUNNER_TEMP/recipient.pem"
+      - name: Upload encrypted configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: warp-awg-config-${{ github.run_id }}
+          path: ${{ runner.temp }}/warp-output/warp-awg.conf.cms
+          if-no-files-found: error
+          retention-days: 1
+      - name: Show download instructions
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo '### Configuration ready'
+            echo "Download the encrypted artifact at the bottom of [this run]($RUN_URL). Decrypt it using the private key matching the supplied certificate."
+            echo ''
+            echo 'Only the encrypted configuration is uploaded. The artifact expires after one day. Keep your recipient private key to decrypt it.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove local credentials
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/warp-reg.json" "$RUNNER_TEMP/warp-output/warp-awg.conf"
